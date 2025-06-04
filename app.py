@@ -7,6 +7,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS # type: ignore
 from google.cloud import vision
 from google.cloud import storage 
+from dotenv import load_dotenv
 
 import vertexai # type: ignore
 from vertexai.generative_models import GenerativeModel, Part, Tool, grounding, HarmCategory, HarmBlockThreshold # type: ignore
@@ -15,17 +16,20 @@ from vertexai.generative_models import GenerativeModel, Part, Tool, grounding, H
 app = Flask(__name__)
 CORS(app) # 開發階段允許所有來源，生產環境應配置具體來源
 
-# --- 配置 ---
-GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "knsh-ai")
-GCP_LOCATION = os.environ.get("GCP_LOCATION", "global")
-GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME", "gemini-2.0-flash")
+# 加載環境變數
+load_dotenv() 
 
-DATASTORE_ID = os.environ.get("DATASTORE_ID", "ai-english-tutor_1747191591294")
+# --- 配置 ---
+GCP_PROJECT_ID = os.environ.get("GCP_PROJECT_ID")
+GCP_LOCATION = os.environ.get("GCP_LOCATION", "global")
+GEMINI_MODEL_NAME = os.environ.get("GEMINI_MODEL_NAME")
+
+DATASTORE_ID = os.environ.get("DATASTORE_ID")
 DATASTORE_COLLECTION_LOCATION = "global"
 DATASTORE_RESOURCE_NAME = f"projects/{GCP_PROJECT_ID}/locations/{DATASTORE_COLLECTION_LOCATION}/collections/default_collection/dataStores/{DATASTORE_ID}"
 
 # GCS Bucket 用於存儲 Prompt 文件
-GCS_PROMPT_BUCKET_NAME = os.environ.get("GCS_PROMPT_BUCKET_NAME", "ai_english_tutor")
+GCS_PROMPT_BUCKET_NAME = os.environ.get("GCS_PROMPT_BUCKET_NAME")
 
 # --- 初始化 Google Cloud 客戶端 ---
 try:
@@ -45,7 +49,7 @@ except Exception as e:
     traceback.print_exc()
 
 # --- 輔助函數 ---
-def perform_ocr(image_file_storage):
+def perform_ocr(image_file_storage): # <--- 恢復 perform_ocr 函數
     """使用 Google Cloud Vision API 對圖片文件執行 OCR。"""
     if not image_file_storage:
         return "OCR_ERROR: No image file provided."
@@ -61,6 +65,7 @@ def perform_ocr(image_file_storage):
         print(f"Error during OCR: {e}")
         traceback.print_exc()
         return f"OCR_ERROR: {str(e)}"
+
 
 def get_prompt_from_gcs(bucket_name, file_path_in_bucket):
     """從 GCS 讀取 Prompt 文本。"""
@@ -104,6 +109,7 @@ def grade_writing():
         submission_type = None
         grade_level = None
         text_input = None
+        bookrange = None
         essay_image_files = []
         learning_sheet_files = []
         reading_writing_files = []
@@ -116,6 +122,9 @@ def grade_writing():
             submission_type = request.form.get('submissionType')
             grade_level = request.form.get('gradeLevel')
             text_input = request.form.get('text')
+            if submission_type == '讀寫習作評分':
+                bookrange = request.form.get('bookrange')
+                print(f"Extracted bookrange from form: {bookrange}")
             essay_image_files = request.files.getlist('essayImage')
             learning_sheet_files = request.files.getlist('learningSheetFile')
             reading_writing_files = request.files.getlist('readingWritingFile')
@@ -128,6 +137,7 @@ def grade_writing():
             data = request.get_json()
             submission_type = data.get('submissionType')
             grade_level = data.get('gradeLevel')
+            bookrange = data.get('bookrange')
             text_input = data.get('text') # JSON 中通常不直接傳文件
             if submission_type == '測驗寫作評改':
                 standard_answer_text = data.get('standardAnswerText', '')
@@ -146,79 +156,140 @@ def grade_writing():
         if not submission_type or not grade_level: # 現在這個判斷更關鍵
             return jsonify({"error": "Missing submissionType or gradeLevel after parsing request"}), 400
 
+        # --- 準備傳遞給 Gemini 的內容列表 ---
+        # Gemini 的 generate_content 可以接受一個 Part 物件列表 (文本和圖片)
+        contents_for_gemini = []
 
-        essay_content = ""
-        source_files_for_ocr = []
+        essay_content = "" # 儲存給 Prompt 字符串的內容 (可以是文本或指示性文本)
+        
+        # 處理學生作業內容：優先文本輸入，其次圖片文件
         if submission_type == '段落寫作評閱' or submission_type == '測驗寫作評改':
             if text_input:
                 essay_content = text_input
             elif essay_image_files:
-                source_files_for_ocr.extend(essay_image_files)
-            else: # 前端應該已經做了驗證，但後端也做一次
+                # 使用 Vision API 執行 OCR，結果用於填入 Prompt 中的 {essay_content}
+                ocr_results = []
+                contents_for_gemini.append(Part.from_text("學生提交的原始作業圖片內容，供您參考理解其版面和手寫內容："))
+                for file_storage in essay_image_files:
+                    file_storage.seek(0) # 重置文件指針，確保 OCR 和圖片 Part 都能讀取到完整內容
+                    ocr_text = perform_ocr(file_storage)
+                    if "OCR_ERROR:" in ocr_text:
+                        print(f"OCR failed for {file_storage.filename}: {ocr_text}. Skipping this file for OCR content.")
+                        # 即使 OCR 失敗，我們仍嘗試將原始圖片作為 Part 傳遞
+                        # 這裡可以選擇報錯或繼續
+                    elif ocr_text.strip():
+                        ocr_results.append(ocr_text)
+                    
+                    # 將原始圖片添加到 Gemini 的 Part 列表中
+                    file_storage.seek(0) # 再次重置指針，確保讀取完整的圖片數據
+                    try:
+                        image_data = file_storage.read()
+                        contents_for_gemini.append(Part.from_data(data=image_data, mime_type=file_storage.content_type))
+                        print(f"Added student essay image {file_storage.filename} as Part.")
+                    except Exception as e:
+                        print(f"Error reading student essay image {file_storage.filename} for Gemini: {e}")
+                        traceback.print_exc()
+                        return jsonify({"error": f"Failed to read student essay image file {file_storage.filename} for Gemini: {str(e)}"}), 400
+
+                if not ocr_results and not text_input: # 如果所有 OCR 都失敗或沒有純文本
+                    return jsonify({"error": "OCR failed or returned empty for all provided images, and no text input."}), 400
+                
+                essay_content = "\n\n".join(ocr_results) if ocr_results else "（圖片內容 OCR 失敗或為空，請參考隨後提供的原始圖片）" # 即使 OCR 失敗，也給個提示
+
+            else:
                 return jsonify({"error": f"For {submission_type}, text input or an essay image is required."}), 400
         elif submission_type == '學習單批改':
             if learning_sheet_files:
-                source_files_for_ocr.extend(learning_sheet_files)
+                ocr_results = []
+                contents_for_gemini.append(Part.from_text("學生提交的原始學習單圖片內容，供您參考理解其版面和手寫內容："))
+                for file_storage in learning_sheet_files:
+                    file_storage.seek(0)
+                    ocr_text = perform_ocr(file_storage)
+                    if "OCR_ERROR:" in ocr_text:
+                        print(f"OCR failed for {file_storage.filename}: {ocr_text}. Skipping this file for OCR content.")
+                    elif ocr_text.strip():
+                        ocr_results.append(ocr_text)
+
+                    file_storage.seek(0)
+                    try:
+                        image_data = file_storage.read()
+                        contents_for_gemini.append(Part.from_data(data=image_data, mime_type=file_storage.content_type))
+                        print(f"Added learning sheet image {file_storage.filename} as Part.")
+                    except Exception as e:
+                        print(f"Error reading learning sheet image {file_storage.filename} for Gemini: {e}")
+                        traceback.print_exc()
+                        return jsonify({"error": f"Failed to read learning sheet file {file_storage.filename} for Gemini: {str(e)}"}), 400
+
+                if not ocr_results:
+                    return jsonify({"error": "OCR failed or returned empty for all provided learning sheet images."}), 400
+                essay_content = "\n\n".join(ocr_results)
             else:
                 return jsonify({"error": "Learning sheet file is required for '學習單批改'."}), 400
         elif submission_type == '讀寫習作評分':
             if reading_writing_files:
-                source_files_for_ocr.extend(reading_writing_files)
+                ocr_results = []
+                contents_for_gemini.append(Part.from_text("學生提交的原始讀寫習作圖片內容，供您參考理解其版面和手寫內容："))
+                for file_storage in reading_writing_files:
+                    file_storage.seek(0)
+                    ocr_text = perform_ocr(file_storage)
+                    if "OCR_ERROR:" in ocr_text:
+                        print(f"OCR failed for {file_storage.filename}: {ocr_text}. Skipping this file for OCR content.")
+                    elif ocr_text.strip():
+                        ocr_results.append(ocr_text)
+
+                    file_storage.seek(0)
+                    try:
+                        image_data = file_storage.read()
+                        contents_for_gemini.append(Part.from_data(data=image_data, mime_type=file_storage.content_type))
+                        print(f"Added reading/writing worksheet image {file_storage.filename} as Part.")
+                    except Exception as e:
+                        print(f"Error reading reading/writing worksheet image {file_storage.filename} for Gemini: {e}")
+                        traceback.print_exc()
+                        return jsonify({"error": f"Failed to read reading/writing worksheet file {file_storage.filename} for Gemini: {str(e)}"}), 400
+
+                if not ocr_results:
+                    return jsonify({"error": "OCR failed or returned empty for all provided reading/writing worksheet images."}), 400
+                essay_content = "\n\n".join(ocr_results)
             else:
                 return jsonify({"error": "Reading/writing worksheet file is required for '讀寫習作評分'."}), 400
-        else: # 處理未知的 submission_type (理論上 prompt_file_map 會先攔截)
+        else:
             return jsonify({"error": f"Unsupported submission type for content processing: {submission_type}"}), 400
 
-        # 如果需要 OCR，現在需要處理多個文件
-        if source_files_for_ocr:
-            ocr_results = []
-            for file_storage in source_files_for_ocr:
-                print(f"Performing OCR for: {file_storage.filename}")
-                # 重置文件指針，如果文件之前被讀取過 (例如 request.files.getlist 可能已經讀取過一次)
-                # 雖然 storage_client.read() 應該能處理，但以防萬一
-                file_storage.seek(0)
-                ocr_text = perform_ocr(file_storage)
-                if "OCR_ERROR:" in ocr_text:
-                    # 決定如何處理單個文件 OCR 失敗：是中止所有，還是忽略這個文件？
-                    # 這裡選擇記錄錯誤並繼續，但最終 essay_content 可能會缺少一部分
-                    print(f"OCR failed for {file_storage.filename}: {ocr_text}. Skipping this file.")
-                    # return jsonify({"error": f"OCR failed for {file_storage.filename}: {ocr_text}"}), 400 # 或者直接報錯
-                elif ocr_text.strip():
-                    ocr_results.append(ocr_text)
-            
-                if not ocr_results: # 如果所有 OCR 都失敗或返回空
-                 return jsonify({"error": "OCR failed or returned empty for all provided images."}), 400
-            
-                # 將所有 OCR 結果合併，通常按順序用換行符分隔
-                # 你可能需要根據圖片的順序來決定如何合併，或者讓 Gemini 模型自己處理多段文本
-                essay_content = "\n\n".join(ocr_results) # 使用雙換行符分隔不同圖片的內容
-
-        if not essay_content.strip():
+        if not essay_content.strip() and not text_input and not contents_for_gemini: # 確保有任何形式的內容
             return jsonify({"error": "Essay content is empty after processing input"}), 400
         print(f"Essay content (first 100 chars): {essay_content[:100]}...")
         
+        # 處理標準答案（僅測驗寫作評改）
         processed_standard_answer = ""
         if submission_type == '測驗寫作評改':
             if standard_answer_text:
                 processed_standard_answer = standard_answer_text
-            elif standard_answer_image_files: # 檢查列表是否有內容
-                print("Performing OCR for standard answer images...")
+            elif standard_answer_image_files:
                 ocr_standard_answer_results = []
+                contents_for_gemini.append(Part.from_text("\n測驗的原始標準答案圖片內容，供您參考理解其版面和手寫內容："))
                 for file_storage in standard_answer_image_files:
                     file_storage.seek(0) # 重置指針
                     ocr_text = perform_ocr(file_storage)
                     if "OCR_ERROR:" in ocr_text:
-                        print(f"OCR for standard answer image {file_storage.filename} failed or returned empty: {ocr_text}")
-                        # 決定如何處理，這裡選擇忽略錯誤的
+                        print(f"OCR for standard answer image {file_storage.filename} failed: {ocr_text}. Skipping OCR content for this file.")
                     elif ocr_text.strip():
                         ocr_standard_answer_results.append(ocr_text)
-                
+                    
+                    file_storage.seek(0) # 再次重置指針
+                    try:
+                        image_data = file_storage.read()
+                        contents_for_gemini.append(Part.from_data(data=image_data, mime_type=file_storage.content_type))
+                        print(f"Added standard answer image {file_storage.filename} as Part.")
+                    except Exception as e:
+                        print(f"Error reading standard answer image {file_storage.filename} for Gemini: {e}")
+                        traceback.print_exc()
+                        print(f"Failed to read standard answer image file {file_storage.filename} for Gemini: {str(e)}")
+
                 if ocr_standard_answer_results:
                     processed_standard_answer = "\n\n".join(ocr_standard_answer_results)
                 else:
-                    # 如果所有標準答案圖片 OCR 都失敗，processed_standard_answer 會是空
+                    processed_standard_answer = "（標準答案圖片內容 OCR 失敗或為空，請參考隨後提供的原始圖片）"
                     print("OCR for all standard answer images failed or returned empty.")
-                    # 你可以選擇在這裡報錯，或者允許沒有標準答案的情況
             print(f"Processed Standard Answer (first 100 chars): {processed_standard_answer[:100]}...")
 
         # --- 1. 根據 submissionType 確定要加載的 Prompt 文件名 ---
@@ -387,52 +458,105 @@ def grade_writing():
         mock_learning_sheet_structure = {
         "submissionType": "學習單批改",
         "title": "📋 學習單批改結果",
-        "questions_feedback": [
+        "sections": [
             {
-            "question_number": "I-1a",
-            "student_answer": "He go to school.",
-            "is_correct": "❌",
-            "comment": "主詞動詞一致性錯誤，應為 goes。",
-            "correct_answer": "He goes to school."
+            "section_title": "[考卷上的大標題(粗體)]",
+            "questions_feedback": [
+                {
+                "question_number": "1",
+                "student_answer": "[學生實際的答案]",
+                "is_correct": "[✅/❌]",
+                "comment": "[根據學生答案正確或錯誤生成內容]",
+                "correct_answer": "[[學生年級]學習單參考答案]",
+                "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
+                "answer_source_content":"[標準答案實際的內容(格式範例:Lesson 1/Pre-listening Questions/1:Yes, there are two sports teams in my school. They are the soccer team and the basketball team.)]"
+                },
+                {
+                "question_number": "2",
+                "student_answer": "[學生實際的答案]",
+                "is_correct": "[✅/❌]",
+                "comment": "[根據學生答案正確或錯誤生成內容]",
+                "correct_answer": "[[學生年級]學習單參考答案]",
+                "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
+                "answer_source_content":"[標準答案實際的內容(格式範例:Lesson 1/Pre-listening Questions/2:Yes, I play sports in my free time.)]"
+                }
+            ],
+            "section_summary": "[根據學生在此部分的表現生成總結]"
             },
             {
-            "question_number": "I-1b",
-            "student_answer": "She is a good student.",
-            "is_correct": "✅",
-            "comment": "回答正確。",
-            "correct_answer": "She is a good student."
+            "section_title": "[考卷上的大標題(粗體)]",
+            "questions_feedback": [
+                {
+                "question_number": "1",
+                "student_answer": "[學生實際的答案]",
+                "is_correct": "[✅/❌]",
+                "comment": "[根據學生答案正確或錯誤生成內容]",
+                "correct_answer": "[[學生年級]學習單參考答案]",
+                "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
+                "answer_source_content":"[標準答案實際的內容(格式範例:Lesson 1/While-listening Notes/1:Do you practice basketball after school every day)]"
+                }
+            ],
+            "section_summary": "[根據學生在此部分的表現生成總結]"
             },
             {
-            "question_number": "II-1 (看圖回答)",
-            "student_answer": "The cat is on the table.",
-            "is_correct": "可接受答案",
-            "comment": "語法正確，與參考答案 'The cat sits on the table.' 意思相近。",
-            "correct_answer": "The cat sits on the table."
+            "section_title": "[考卷上的大標題(粗體)]",
+            "questions_feedback": [
+                {
+                "question_number": "1",
+                "student_answer": "[學生實際的答案]",
+                "is_correct": "[✅/❌]",
+                "comment": "[根據學生答案正確或錯誤生成內容]",
+                "correct_answer": "[[學生年級]學習單參考答案]",
+                "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
+                "answer_source_content":"[標準答案實際的內容(格式範例:Lesson 1/Dialogue Mind Map/1:basketball]"
+                }
+            ],
+            "section_summary": "[根據學生在此部分的表現生成總結，並依照III.的配分計分]"
             },
             {
-            "question_number": "III-1 (造句)",
-            "student_answer": "I like apple.",
-            "is_correct": "❌",
-            "comment": "名詞 'apple' 作為可數名詞單數時，前面通常需要冠詞，或使用複數形式。且 'apple' 用字未在建議範圍內。",
-            "correct_answer": "I like an apple. / I like apples. (建議使用教材範圍內水果，如 I like bananas.)"
+            "section_title": "[考卷上的大標題(粗體)]",
+            "questions_feedback": [ 
+                {
+                "question_number": "1", 
+                "student_answer": "[學生實際的答案]",
+                "is_correct": "[✅/❌]", 
+                "comment": "[根據學生答案正確或錯誤生成內容]",
+                "correct_answer": "[[學生年級]學習單參考答案]",
+                "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
+                "answer_source_content":"[標準答案實際的內容(格式範例:Lesson 1/Post-listening Questions and Answers/1:They worry about their grades at school.)]"
+                }
+            ],
+            "section_summary": "[根據學生在此部分的表現生成總結]"
             }
         ],
-        "score_summary_title": "📊 總分統計",
-        "score_details": [
+        "overall_score_summary_title": "✅ 總分統計與等第建議",
+        "score_breakdown_table": [
             {
-            "description": "正確及可接受：3 題 × 25 分 (估計)",
-            "points": "75 分"
+            "section": "[考卷上的大標題(粗體)]",
+            "max_score": "[根據考卷上的配分]",
+            "obtained_score": "[計算此部分得分]"
             },
             {
-            "description": "錯誤：1 題 × 25 分 (估計)",
-            "points": "-25 分"
+            "section": "[考卷上的大標題(粗體)]",
+            "max_score": "[根據考卷上的配分]",
+            "obtained_score": "[計算此部分得分]"
+            },
+            {
+            "section": "[考卷上的大標題(粗體)]",
+            "max_score": "[根據考卷上的配分]",
+            "obtained_score": "[計算此部分得分]"
+            },
+            {
+            "section": "[考卷上的大標題(粗體)]",
+            "max_score": "[根據考卷上的配分]",
+            "obtained_score": "[計算此部分得分]"
             }
         ],
-        "total_score_text": "總分：75.0 / 100 分 (估計)",
-        "suggested_grade_title": "🎓 等第建議",
-        "suggested_grade": "B",
-        "feedback_summary_title": "📌 回饋建議",
-        "feedback_summary": "本次學習單作答情況尚可。在選擇題和部分簡答題上表現不錯，能正確運用所學句型。但在造句和部分文法細節（如主詞動詞一致性、冠詞使用）上仍有進步空間。請特別注意參考答案中的正確用法，並多加練習。詞彙方面，請盡量使用教材建議範圍內的單字。繼續努力！"
+        "final_total_score_text": "總分：100 學生分數：[學生得分]",
+        "final_suggested_grade_title": "🔺等第建議",
+        "final_suggested_grade_text": "[根據總分生成建議等第與說明]",
+        "overall_feedback_title": "📚 總結性回饋建議（可複製給學生）",
+        "overall_feedback": "[針對學生考卷的作答整體表現生成正面總結性回饋]"
         }
 
         # 新增：讀寫習作評分的 JSON 結構範例
@@ -441,93 +565,103 @@ def grade_writing():
         "title": "📘讀寫習作批改結果",
         "sections": [
             {
-            "section_title": "I. Vocabulary & Grammar (選擇題)",
+            "section_title": "I. [考卷上的大標題與配分]",
             "questions_feedback": [
                 {
                 "question_number": "1",
-                "student_answer": "B) is",
-                "is_correct": "✅",
-                "comment": "回答正確。",
-                "correct_answer": "B) is"
+                "student_answer": "[學生實際的答案]",
+                "is_correct": "[✅/❌]",
+                "comment": "[根據學生答案正確或錯誤生成內容]",
+                "correct_answer": "[[學生年級]習作標準答案]",
+                "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
+                "answer_source_content":"[標準答案實際的內容(格式範例:Book 5/Lesson 2/I Read and Write/1:interests)]"
                 },
                 {
                 "question_number": "2",
-                "student_answer": "A) go",
-                "is_correct": "❌",
-                "comment": "主詞為第三人稱單數 He，動詞應為 goes。",
-                "correct_answer": "C) goes"
+                "student_answer": "[學生實際的答案]",
+                "is_correct": "[✅/❌]",
+                "comment": "[根據學生答案正確或錯誤生成內容]",
+                "correct_answer": "[[學生年級]習作標準答案]",
+                "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
+                "answer_source_content":"[標準答案實際的內容(格式範例:Book 5/Lesson 2/I Read and Write/2:reason)]"
                 }
             ],
-            "section_summary": "共 10 題，8 題正確，預估得分 16 分 (每題2分估計)"
+            "section_summary": "[根據學生在此部分的表現生成總結，並依照I.的配分計分]"
             },
             {
-            "section_title": "II. Cloze Test (克漏字)",
+            "section_title": "II. [考卷上的大標題與配分]",
             "questions_feedback": [
                 {
                 "question_number": "1",
-                "student_answer": "playing",
-                "is_correct": "✅",
-                "comment": "回答正確。",
-                "correct_answer": "playing"
+                "student_answer": "[學生實際的答案]",
+                "is_correct": "[✅/❌]",
+                "comment": "[根據學生答案正確或錯誤生成內容]",
+                "correct_answer": "[[學生年級]習作標準答案]",
+                "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
+                "answer_source_content":"[標準答案實際的內容(格式範例:Book 5/Lesson 2/II Look and Fill In/1:tiring)]"
                 }
             ],
-            "section_summary": "共 5 題，4 題正確，預估得分 8 分 (每題2分估計)"
+            "section_summary": "[根據學生在此部分的表現生成總結，並依照II.的配分計分]"
             },
             {
-            "section_title": "III. Reading Comprehension (閱讀測驗)",
+            "section_title": "III. [考卷上的大標題與配分]",
             "questions_feedback": [
                 {
                 "question_number": "1",
-                "student_answer": "A) Because he was sick.",
-                "is_correct": "✅",
-                "comment": "回答正確。",
-                "correct_answer": "A) Because he was sick."
+                "student_answer": "[學生實際的答案]",
+                "is_correct": "[✅/❌]",
+                "comment": "[根據學生答案正確或錯誤生成內容]",
+                "correct_answer": "[[學生年級]習作標準答案]",
+                "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
+                "answer_source_content":"[標準答案實際的內容(格式範例:Book 5/Lesson 2/III Read and Write/1:James thought (that) Linda would like the gift.]"
                 }
             ],
-            "section_summary": "共 5 題，5 題正確，預估得分 15 分 (每題3分估計)"
+            "section_summary": "[根據學生在此部分的表現生成總結，並依照III.的配分計分]"
             },
             {
-            "section_title": "IV. Write (引導式寫作)",
+            "section_title": "IV.[考卷上的大標題與配分]",
             "questions_feedback": [ 
                 {
-                "question_number": "IV", 
-                "student_answer": "My favorite season is summer. I like summer because I can go swimming. The weather is hot, but I feel happy. I also like to eat ice cream in summer. Summer is a wonderful season.",
-                "is_correct": "可接受答案", 
-                "comment": "內容表達基本清晰，文法大致正確。句子結構可以更豐富些。使用了 'wonderful'，詞彙尚可。符合題目要求。預估符合程度：良好 (約占此題滿分的75-85%)",
-                "correct_answer": "（此為開放性寫作題，無唯一標準答案。可參考範文：My favorite season is summer. I enjoy it because the long, sunny days allow me to go swimming at the beach. Although the weather can be very hot, I always feel energetic and happy. Eating delicious ice cream is another great pleasure of summer. For me, summer is truly a fantastic season full of joy.）"
+                "question_number": "1", 
+                "student_answer": "[學生實際的答案]",
+                "is_correct": "[✅/❌]", 
+                "comment": "[根據學生答案正確或錯誤生成內容]",
+                "correct_answer": "[[學生年級]習作標準答案]",
+                "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
+                "answer_source_content":"[標準答案實際的內容(格式範例:Book 5/Lesson 2/IV Fill In/1:reasons / choice)]"
                 }
             ],
-            "section_summary": "引導式寫作：內容表達良好，文法尚可，預估得分 12 分 (滿分15分估計)"
+            "section_summary": "[根據學生在此部分的表現生成總結，並依照IV.的配分計分]"
             }
         ],
         "overall_score_summary_title": "✅ 總分統計與等第建議",
         "score_breakdown_table": [
             {
             "section": "I. Vocabulary & Grammar",
-            "max_score": "25 分 (估計)",
-            "obtained_score": "16 分"
+            "max_score": "[根據考卷上的配分]",
+            "obtained_score": "[計算此部分得分]"
             },
             {
             "section": "II. Cloze Test",
-            "max_score": "25 分 (估計)",
-            "obtained_score": "8 分"
+            "max_score": "[根據考卷上的配分]",
+            "obtained_score": "[計算此部分得分]"
             },
             {
             "section": "III. Reading Comprehension",
-            "max_score": "25 分 (估計)",
-            "obtained_score": "15 分"
+            "max_score": "[根據考卷上的配分]",
+            "obtained_score": "[計算此部分得分]"
             },
             {
             "section": "IV. Write",
-            "max_score": "25 分 (估計)",
-            "obtained_score": "12 分"
+            "max_score": "[根據考卷上的配分]",
+            "obtained_score": "[計算此部分得分]"
             }
         ],
-        "final_total_score_text": "總分 100 (估計滿分) 得分 51",
+        "final_total_score_text": "總分：100 學生分數：[學生得分]",
         "final_suggested_grade_title": "🔺等第建議",
-        "final_suggested_grade_text": "B (表現良好，多數題目回答正確，寫作部分有發展空間【參考檔案規則：總分百分比 80-89% 為 B】)",
+        "final_suggested_grade_text": "[根據總分生成建議等第與說明]",
         "overall_feedback_title": "📚 總結性回饋建議（可複製給學生）",
-        "overall_feedback": "本次讀寫習作整體表現良好。你在選擇題和閱讀測驗部分展現了不錯的理解和判斷能力，大部分題目都能正確作答。克漏字部分也掌握得不錯。引導式寫作方面，內容表達基本清晰，但可以嘗試運用更多元的句型和詞彙來豐富表達，並注意文法細節的準確性。請繼續加強寫作練習，並仔細對照參考答案中的錯誤點進行訂正，相信會有更大的進步！"
+        "overall_feedback": "[針對學生考卷的作答整體表現生成正面總結性回饋]"
         }
         json_format_example_str = get_json_format_example(
             submission_type,
@@ -542,10 +676,11 @@ def grade_writing():
         # 例如： "學生年級：{grade_level}\n作文內容：\n{essay_content}\nJSON範例：\n{json_example}"
         try:
             final_prompt = base_prompt_text.format(
+                Book = bookrange if submission_type == '讀寫習作評分' else "",
                 grade_level=grade_level,
                 submission_type=submission_type, # Prompt 模板中可能需要
-                essay_content=essay_content,
-                standard_answer_if_any=processed_standard_answer if submission_type == '測驗寫作評改' else "",
+                essay_content=essay_content, # 這裡將包含 OCR 結果或提示文本
+                standard_answer_if_any=processed_standard_answer if submission_type == '測驗寫作評改' else "",  # 這裡將包含 OCR 結果或提示文本
                 scoring_instructions_if_any=scoring_instructions if submission_type == '測驗寫作評改' else "",
                 json_format_example_str=json_format_example_str
             )
@@ -555,17 +690,22 @@ def grade_writing():
 
         print(f"Final prompt (first 300 chars, excluding JSON example): {final_prompt.split('JSON 輸出格式範例：')[0][:300]}...")
 
+        # 將 final_prompt 字符串作為第一個文本 Part 加入到 contents_for_gemini 列表的開頭
+        contents_for_gemini.insert(0, Part.from_text(final_prompt))
+
+        print(f"Total parts to send to Gemini: {len(contents_for_gemini)}")
+
         # --- 5. 調用 Gemini 模型 ---
         generation_config = {
-            "temperature": 0.7,
-            "top_p": 1,
+            "temperature": 0.1,
+            "top_p": 0.5,
             "max_output_tokens": 8192,
             "response_mime_type": "application/json",
         }
 
         print("Calling Gemini model...")
         response = gemini_model.generate_content(
-            final_prompt,
+            contents_for_gemini,
             generation_config=generation_config,
             tools=tools_list
         )
@@ -576,8 +716,29 @@ def grade_writing():
             error_detail = str(response) if len(str(response)) < 500 else str(response)[:500] + "..."
             print(f"Error: Gemini response empty or not as expected. Details: {error_detail}")
             return jsonify({"error": "AI model did not return a valid response.", "details_for_log": error_detail}), 500
+        
+        ai_response_text = ""
+        # 遍歷所有 Part，尋找包含 JSON 格式的文本部分
+        # 有些模型會在 JSON 之前加上一個簡單的文字 Part
+        # 我們需要確保取得的是實際的 JSON 文本
+        for part in response.candidates[0].content.parts:
+            if part.text: # 確保是文本 Part
+                if "```json" in part.text:
+                    ai_response_text = part.text # 找到 JSON 所在的部分
+                    break # 找到後就停止，因為 JSON 通常在一個完整的 Part 中
+                else:
+                    # 如果不是 JSON 區塊，可能是開頭的提示語，可以選擇忽略或拼接
+                    # 為了確保只解析 JSON，這裡先只保留 JSON 區塊
+                    pass
+        
+        if not ai_response_text: # 如果最終沒有找到 JSON 文本
+            # 這是一個回退機制，以防模型沒有使用 ````json` 格式，或者只返回了單一文本
+            # 但如果模型確實返回了多個 Part 且其中一個是純 JSON，這會失敗
+            print("Warning: Did not find '```json' in response parts. Attempting to concatenate all text parts as fallback.")
+            ai_response_text = "".join([p.text for p in response.candidates[0].content.parts if p.text])
+       
 
-        ai_response_text = response.text
+        #ai_response_text = response.text
         print(f"Raw AI response text (first 300 chars): {ai_response_text[:300]}...")
 
         # 清理常見的 Markdown 包裝
