@@ -10,7 +10,7 @@ from google.cloud import storage
 from dotenv import load_dotenv
 
 import vertexai # type: ignore
-from vertexai.generative_models import GenerativeModel, Part, Tool, grounding, HarmCategory, HarmBlockThreshold # type: ignore
+from vertexai.generative_models import GenerativeModel, Part, Tool, grounding, HarmCategory, HarmBlockThreshold, ToolConfig # type: ignore
 
 # --- 初始化 Flask 應用 ---
 app = Flask(__name__)
@@ -72,6 +72,7 @@ def get_prompt_from_gcs(bucket_name, file_path_in_bucket):
     try:
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(file_path_in_bucket)
+        print(f"bucket_name:{bucket_name},file_path_in_bucket:{file_path_in_bucket}")
         if not blob.exists():
             print(f"Error: Prompt file gs://{bucket_name}/{file_path_in_bucket} not found.")
             return None
@@ -80,6 +81,121 @@ def get_prompt_from_gcs(bucket_name, file_path_in_bucket):
         return prompt_text
     except Exception as e:
         print(f"Error fetching prompt from GCS (gs://{bucket_name}/{file_path_in_bucket}): {e}")
+        traceback.print_exc()
+        return None
+    
+def get_standard_answer_for_lesson_from_gcs(bucket_name, base_file_path, grade_level, learnsheets_key, worksheet_category):
+    """
+    從 GCS 讀取指定年級和學習單主題的完整標準答案 JSON，
+    並提取該主題 (Lesson X) 的數據。
+    
+    Args:
+        bucket_name (str): GCS 存儲桶名稱。
+        base_file_path (str): 基礎檔案路徑，例如 'ai_english_tutor/ai_english_file/'。
+        grade_level (str): 年級，例如 '七年級'。
+        learnsheets_key (str): 學習單主題，例如 'Lesson 1'。
+        
+    Returns:
+        dict: 該 Lesson 的標準答案數據字典，如果找不到則返回 None。
+    """
+    answer_file_map = {
+        "七年級全英提問學習單參考答案":"全英提問學習單參考答案(01_1下).txt",
+        "八年級全英提問學習單參考答案":"全英提問學習單參考答案(01_2下).txt",
+        "九年級全英提問學習單參考答案":"全英提問學習單參考答案(01_3下).txt",
+        "七年級差異化學習單參考答案":"差異化學習單參考答案(01_1下).txt",
+        "八年級差異化學習單參考答案":"差異化學習單參考答案(01_2下).txt",
+        "九年級差異化學習單參考答案":"差異化學習單參考答案(01_3下).txt",
+    }
+
+    # 根據 grade_level 和 worksheet_category 找到對應的檔案
+    full_file_key = f"{grade_level}{worksheet_category}"
+    target_filename = answer_file_map.get(full_file_key)
+    
+    if not target_filename:
+        print(f"Error: No standard answer file found for grade '{grade_level}' and category '{worksheet_category}'.")
+        return None
+    
+    try:
+        bucket = storage_client.bucket(bucket_name)
+        base_file_path = f"{base_file_path}{target_filename}"
+        blob = bucket.blob(base_file_path)
+        print(f"base_file_path:{base_file_path},target_filename:{target_filename},bucket_name:{bucket_name},blob:{blob}")
+        if not blob.exists():
+            print(f"Error: Standard answer file gs://{bucket_name}{base_file_path} not found.")
+            return None
+        
+        json_content = blob.download_as_text()
+        all_answers_data = json.loads(json_content)
+        
+        # 提取指定 learnsheets_key (例如 "Lesson 1") 的數據
+        lesson_data = all_answers_data.get(learnsheets_key)
+        
+        if not lesson_data:
+            print(f"Warning: '{learnsheets_key}' not found in standard answer file {target_filename}.")
+            return None
+            
+        print(f"Successfully loaded standard answers for {learnsheets_key} from gs://{bucket_name}/{target_filename}")
+        return lesson_data
+    
+    except Exception as e:
+        print(f"Error fetching standard answers from GCS (gs://{bucket_name}/{target_filename}): {e}")
+        traceback.print_exc()
+        return None
+    
+def get_standard_answer_for_reading_writing_from_gcs(bucket_name, base_file_path, grade_level, bookrange):
+    """
+    從 GCS 讀取指定年級和冊次的讀寫習作標準答案 JSON，
+    並提取該冊次 (例如 Book 5) 的數據。
+    
+    Args:
+        bucket_name (str): GCS 存儲桶名稱。
+        base_file_path (str): 基礎檔案路徑，例如 'ai_english_tutor/ai_english_file/'。
+        grade_level (str): 年級，例如 '七年級'。
+        bookrange (str): 冊次主題，例如 'Book 5'。
+        
+    Returns:
+        dict: 該冊次的標準答案數據字典，如果找不到則返回 None。
+    """
+    # 假設讀寫習作的答案檔名格式
+    answer_file_map = {
+        "七年級讀寫習作參考答案": "113_1習作標準答案.txt", 
+        "八年級讀寫習作參考答案": "113_2習作標準答案.txt", 
+        "九年級讀寫習作參考答案": "113_3習作標準答案.txt", 
+    }
+
+    # 根據 grade_level 找到對應的檔案
+    full_file_key = f"{grade_level}讀寫習作參考答案"
+    target_filename = answer_file_map.get(full_file_key)
+    
+    if not target_filename:
+        print(f"Error: No standard answer file found for reading/writing grade '{grade_level}'.")
+        return None
+    
+    try:
+        bucket = storage_client.bucket(bucket_name)
+        full_file_path = f"{base_file_path}{target_filename}"
+        blob = bucket.blob(full_file_path)
+        print(f"Attempting to load reading/writing answers from: gs://{bucket_name}/{full_file_path}")
+
+        if not blob.exists():
+            print(f"Error: Standard answer file gs://{bucket_name}/{full_file_path} not found.")
+            return None
+        
+        json_content = blob.download_as_text()
+        all_answers_data = json.loads(json_content)
+        
+        # 提取指定 bookrange_key (例如 "Book 5") 的數據
+        book_data = all_answers_data.get(bookrange)
+        
+        if not book_data:
+            print(f"Warning: '{bookrange}' not found in standard answer file {target_filename}.")
+            return None
+            
+        print(f"Successfully loaded standard answers for {bookrange} from gs://{bucket_name}/{target_filename}")
+        return book_data
+    
+    except Exception as e:
+        print(f"Error fetching reading/writing standard answers from GCS (gs://{bucket_name}/{target_filename}): {e}")
         traceback.print_exc()
         return None
 
@@ -103,13 +219,15 @@ def get_json_format_example(submission_type, mock_paragraph, mock_quiz, mock_lea
 @app.route('/api/grade', methods=['POST'])
 def grade_writing():
     print(f"\n--- New request to /api/grade ---")
-    print(f"Request Content-Type: {request.content_type}") # <--- 添加這行來打印 Content-Type
+    print(f"Request Content-Type: {request.content_type}")
 
     try:
         submission_type = None
         grade_level = None
         text_input = None
         bookrange = None
+        learnsheets = None
+        worksheet_category = None
         essay_image_files = []
         learning_sheet_files = []
         reading_writing_files = []
@@ -125,6 +243,10 @@ def grade_writing():
             if submission_type == '讀寫習作評分':
                 bookrange = request.form.get('bookrange')
                 print(f"Extracted bookrange from form: {bookrange}")
+            if submission_type == '學習單批改':
+                learnsheets = request.form.get('learnsheets')
+                worksheet_category = request.form.get('worksheetCategory')
+                print(f"Extracted learnsheets from form: {learnsheets},Category: {worksheet_category}")
             essay_image_files = request.files.getlist('essayImage')
             learning_sheet_files = request.files.getlist('learningSheetFile')
             reading_writing_files = request.files.getlist('readingWritingFile')
@@ -138,15 +260,15 @@ def grade_writing():
             submission_type = data.get('submissionType')
             grade_level = data.get('gradeLevel')
             bookrange = data.get('bookrange')
-            text_input = data.get('text') # JSON 中通常不直接傳文件
+            learnsheets = data.get('learnsheets')
+            worksheet_category = data.get('worksheetCategory')
+            text_input = data.get('text') 
             if submission_type == '測驗寫作評改':
                 standard_answer_text = data.get('standardAnswerText', '')
-                # JSON 通常不直接傳文件，所以 standard_answer_image_file 通常會是 None
                 scoring_instructions = data.get('scoringInstructions', '')
         else:
             print(f"Warning: Received request with unhandled Content-Type: {request.content_type}")
-            # 可以選擇在這裡返回錯誤，或者嘗試從 request.form 獲取（如果可能是 x-www-form-urlencoded）
-            submission_type = request.form.get('submissionType') # 最後嘗試
+            submission_type = request.form.get('submissionType')
             grade_level = request.form.get('gradeLevel')
 
 
@@ -291,6 +413,40 @@ def grade_writing():
                     processed_standard_answer = "（標準答案圖片內容 OCR 失敗或為空，請參考隨後提供的原始圖片）"
                     print("OCR for all standard answer images failed or returned empty.")
             print(f"Processed Standard Answer (first 100 chars): {processed_standard_answer[:100]}...")
+        # --- 新增：載入學習單標準答案的邏輯 ---
+        standard_answers_json_str = "" 
+
+        # 邏輯 1：處理「學習單批改」的標準答案
+        if submission_type == '學習單批改' and learnsheets and worksheet_category:
+            print(f"Attempting to load standard answers for {grade_level} {worksheet_category} {learnsheets}")
+            standard_answers_data = get_standard_answer_for_lesson_from_gcs(
+                GCS_PROMPT_BUCKET_NAME,
+                "ai_english_file/", # 你的 GCS 檔案路徑
+                grade_level,
+                learnsheets,
+                worksheet_category
+            )
+            if standard_answers_data:
+                standard_answers_json_str = json.dumps(standard_answers_data, ensure_ascii=False, indent=2)
+                print(f"Loaded specific '學習單' standard answers (first 200 chars): {standard_answers_json_str[:200]}...")
+            else:
+                print("Failed to load specific '學習單' standard answers. Gemini will rely on search_tool for all answers.")
+        
+        # 邏輯 2：【新增】處理「讀寫習作評分」的標準答案
+        elif submission_type == '讀寫習作評分' and bookrange:
+            print(f"Attempting to load standard answers for {grade_level} {bookrange}")
+            standard_answers_data = get_standard_answer_for_reading_writing_from_gcs(
+                GCS_PROMPT_BUCKET_NAME,
+                "ai_english_file/", # 你的 GCS 檔案路徑
+                grade_level,
+                bookrange # 使用 bookrange 作為 key
+            )
+            if standard_answers_data:
+                standard_answers_json_str = json.dumps(standard_answers_data, ensure_ascii=False, indent=2)
+                print(f"Loaded specific '讀寫習作' standard answers (first 200 chars): {standard_answers_json_str[:200]}...")
+            else:
+                print("Failed to load specific '讀寫習作' standard answers. Gemini will rely on search_tool for all answers.")
+
 
         # --- 1. 根據 submissionType 確定要加載的 Prompt 文件名 ---
         prompt_file_map = {
@@ -467,7 +623,7 @@ def grade_writing():
                 "student_answer": "[學生實際的答案]",
                 "is_correct": "[✅/❌]",
                 "comment": "[根據學生答案正確或錯誤生成內容]",
-                "correct_answer": "[[學生年級]學習單參考答案]",
+                "correct_answer": "[[標準答案]中對應題號的正確答案]",
                 "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
                 "answer_source_content":"[標準答案實際的內容(格式範例:Lesson 1/Pre-listening Questions/1:Yes, there are two sports teams in my school. They are the soccer team and the basketball team.)]"
                 },
@@ -476,7 +632,7 @@ def grade_writing():
                 "student_answer": "[學生實際的答案]",
                 "is_correct": "[✅/❌]",
                 "comment": "[根據學生答案正確或錯誤生成內容]",
-                "correct_answer": "[[學生年級]學習單參考答案]",
+                "correct_answer": "[[標準答案]中對應題號的正確答案]",
                 "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
                 "answer_source_content":"[標準答案實際的內容(格式範例:Lesson 1/Pre-listening Questions/2:Yes, I play sports in my free time.)]"
                 }
@@ -491,7 +647,7 @@ def grade_writing():
                 "student_answer": "[學生實際的答案]",
                 "is_correct": "[✅/❌]",
                 "comment": "[根據學生答案正確或錯誤生成內容]",
-                "correct_answer": "[[學生年級]學習單參考答案]",
+                "correct_answer": "[[標準答案]中對應題號的正確答案]",
                 "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
                 "answer_source_content":"[標準答案實際的內容(格式範例:Lesson 1/While-listening Notes/1:Do you practice basketball after school every day)]"
                 }
@@ -506,7 +662,7 @@ def grade_writing():
                 "student_answer": "[學生實際的答案]",
                 "is_correct": "[✅/❌]",
                 "comment": "[根據學生答案正確或錯誤生成內容]",
-                "correct_answer": "[[學生年級]學習單參考答案]",
+                "correct_answer": "[[標準答案]中對應題號的正確答案]",
                 "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
                 "answer_source_content":"[標準答案實際的內容(格式範例:Lesson 1/Dialogue Mind Map/1:basketball]"
                 }
@@ -521,7 +677,7 @@ def grade_writing():
                 "student_answer": "[學生實際的答案]",
                 "is_correct": "[✅/❌]", 
                 "comment": "[根據學生答案正確或錯誤生成內容]",
-                "correct_answer": "[[學生年級]學習單參考答案]",
+                "correct_answer": "[[標準答案]中對應題號的正確答案]",
                 "answer_source_query":"[標準答案實際出處(search_tool(query=''))]",
                 "answer_source_content":"[標準答案實際的內容(格式範例:Lesson 1/Post-listening Questions and Answers/1:They worry about their grades at school.)]"
                 }
@@ -677,18 +833,20 @@ def grade_writing():
         try:
             final_prompt = base_prompt_text.format(
                 Book = bookrange if submission_type == '讀寫習作評分' else "",
+                learnsheet = learnsheets if submission_type == '學習單批改' else "",
                 grade_level=grade_level,
-                submission_type=submission_type, # Prompt 模板中可能需要
-                essay_content=essay_content, # 這裡將包含 OCR 結果或提示文本
-                standard_answer_if_any=processed_standard_answer if submission_type == '測驗寫作評改' else "",  # 這裡將包含 OCR 結果或提示文本
+                submission_type=submission_type,
+                essay_content=essay_content,
+                standard_answer_if_any=processed_standard_answer if submission_type == '測驗寫作評改' else "",
                 scoring_instructions_if_any=scoring_instructions if submission_type == '測驗寫作評改' else "",
-                json_format_example_str=json_format_example_str
+                json_format_example_str=json_format_example_str,
+                current_lesson_standard_answers_json=standard_answers_json_str
             )
         except KeyError as ke:
             print(f"Error formatting prompt: Missing key {ke} in prompt template or provided variables.")
             return jsonify({"error": f"Prompt template formatting error: Missing key {ke}"}), 500
 
-        print(f"Final prompt (first 300 chars, excluding JSON example): {final_prompt.split('JSON 輸出格式範例：')[0][:300]}...")
+        print(f"Final prompt (first 300 chars, excluding JSON example): {final_prompt.split('JSON 輸出格式範例：')}...")
 
         # 將 final_prompt 字符串作為第一個文本 Part 加入到 contents_for_gemini 列表的開頭
         contents_for_gemini.insert(0, Part.from_text(final_prompt))
@@ -698,8 +856,8 @@ def grade_writing():
         # --- 5. 調用 Gemini 模型 ---
         generation_config = {
             "temperature": 0.1,
-            "top_p": 0.5,
-            "max_output_tokens": 8192,
+            "top_p": 0.2,
+            "max_output_tokens": 16384,
             "response_mime_type": "application/json",
         }
 
