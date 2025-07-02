@@ -921,6 +921,10 @@ def grade_writing():
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
         }
 
+        # 在呼叫 gemini_model.generate_content(...) 之前
+        print(f"DEBUG: Size of final_prompt in memory: {get_size(final_prompt):.2f} MB")
+        print(f"DEBUG: Size of contents_for_gemini list in memory: {get_size(contents_for_gemini):.2f} MB")
+
         print("Calling Gemini model with non-streaming mode...")
         
         # 【修改點 1】將呼叫 Gemini 的程式碼包在 try-except 中，以捕獲 API 可能的錯誤
