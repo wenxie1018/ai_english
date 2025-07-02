@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import traceback 
 
 from flask import Flask, request, jsonify
@@ -49,6 +50,57 @@ except Exception as e:
     traceback.print_exc()
 
 # --- 輔助函數 ---
+def get_size(obj):
+    """遞歸計算物件在記憶體中的大小（以MB為單位）。"""
+    seen_ids = set()
+    
+    def sizeof_detail(o):
+        if id(o) in seen_ids:
+            return 0
+        seen_ids.add(id(o))
+        size = sys.getsizeof(o)
+        if isinstance(o, dict):
+            size += sum(sizeof_detail(v) for v in o.values())
+            size += sum(sizeof_detail(k) for k in o.keys())
+        elif hasattr(o, '__dict__'):
+            size += sizeof_detail(o.__dict__)
+        elif hasattr(o, '__iter__') and not isinstance(o, (str, bytes, bytearray)):
+            size += sum(sizeof_detail(i) for i in o)
+        return size
+
+    return sizeof_detail(obj) / (1024 * 1024)
+
+def process_and_compress_image(file_bytes, max_size_mb=20, max_dimension=1200, quality=85):
+    """
+    檢查、壓縮並調整圖片大小。
+    返回壓縮後的圖片二進制數據，如果檔案過大或非圖片則返回 None。
+    """
+    file_size_mb = len(file_bytes) / (1024 * 1024)
+    if file_size_mb > max_size_mb:
+        print(f"ERROR: File is too large ({file_size_mb:.2f}MB), limit is {max_size_mb}MB.")
+        return None
+        
+    try:
+        img = Image.open(io.BytesIO(file_bytes))
+        
+        # 轉換為 RGB 以避免處理 RGBA 或 P 模式時的儲存問題
+        if img.mode not in ('RGB', 'L'): # L for grayscale
+            img = img.convert('RGB')
+            
+        img.thumbnail((max_dimension, max_dimension))
+        
+        output_buffer = io.BytesIO()
+        img.format = 'JPEG' # 強制存為 JPEG 以確保壓縮
+        img.save(output_buffer, format='JPEG', quality=quality)
+        compressed_bytes = output_buffer.getvalue()
+        
+        compressed_size_mb = len(compressed_bytes) / (1024 * 1024)
+        print(f"Image compressed from {file_size_mb:.2f}MB to {compressed_size_mb:.2f}MB.")
+        return compressed_bytes
+    except Exception as e:
+        print(f"ERROR: Could not process or compress image. It might not be a valid image file. Error: {e}")
+        return None
+    
 def perform_ocr(image_file_storage): # <--- 恢復 perform_ocr 函數
     """使用 Google Cloud Vision API 對圖片文件執行 OCR。"""
     if not image_file_storage:
@@ -861,67 +913,88 @@ def grade_writing():
             "response_mime_type": "application/json",
         }
 
-        print("Calling Gemini model...")
-        response = gemini_model.generate_content(
-            contents_for_gemini,
-            generation_config=generation_config,
-            tools=tools_list
-        )
-        print("Gemini model responded.")
+        # 設置安全設定，避免因安全問題被阻擋
+        safety_settings = {
+            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+        }
 
-        # --- 6. 處理 Gemini 的回應 ---
-        if not response.candidates or not response.candidates[0].content.parts:
-            error_detail = str(response) if len(str(response)) < 500 else str(response)[:500] + "..."
-            print(f"Error: Gemini response empty or not as expected. Details: {error_detail}")
-            return jsonify({"error": "AI model did not return a valid response.", "details_for_log": error_detail}), 500
+        print("Calling Gemini model with non-streaming mode...")
         
-        ai_response_text = ""
-        # 遍歷所有 Part，尋找包含 JSON 格式的文本部分
-        # 有些模型會在 JSON 之前加上一個簡單的文字 Part
-        # 我們需要確保取得的是實際的 JSON 文本
-        for part in response.candidates[0].content.parts:
-            if part.text: # 確保是文本 Part
-                if "```json" in part.text:
-                    ai_response_text = part.text # 找到 JSON 所在的部分
-                    break # 找到後就停止，因為 JSON 通常在一個完整的 Part 中
-                else:
-                    # 如果不是 JSON 區塊，可能是開頭的提示語，可以選擇忽略或拼接
-                    # 為了確保只解析 JSON，這裡先只保留 JSON 區塊
-                    pass
-        
-        if not ai_response_text: # 如果最終沒有找到 JSON 文本
-            # 這是一個回退機制，以防模型沒有使用 ````json` 格式，或者只返回了單一文本
-            # 但如果模型確實返回了多個 Part 且其中一個是純 JSON，這會失敗
-            print("Warning: Did not find '```json' in response parts. Attempting to concatenate all text parts as fallback.")
-            ai_response_text = "".join([p.text for p in response.candidates[0].content.parts if p.text])
-       
+        # 【修改點 1】將呼叫 Gemini 的程式碼包在 try-except 中，以捕獲 API 可能的錯誤
+        try:
+            response = gemini_model.generate_content(
+                contents_for_gemini,
+                generation_config=generation_config,
+                tools=tools_list,
+                safety_settings=safety_settings  # 【新增】加入安全設定
+            )
+            print("Gemini model responded.")
+        except Exception as api_error:
+            print(f"Error calling Gemini API: {api_error}")
+            traceback.print_exc()
+            # 嘗試打印 response 的部分內容以供除錯
+            error_details = str(api_error)
+            return jsonify({"error": "AI model API call failed.", "details_for_log": error_details}), 500
 
-        #ai_response_text = response.text
-        print(f"Raw AI response text (first 300 chars): {ai_response_text[:300]}...")
-
-        # 清理常見的 Markdown 包裝
-        if ai_response_text.strip().startswith("```json"):
-            ai_response_text = ai_response_text.strip()[7:-3].strip()
-        elif ai_response_text.strip().startswith("```"):
-            ai_response_text = ai_response_text.strip()[3:-3].strip()
 
         try:
+            # 步驟 1: 檢查是否有候選答案
+            if not response.candidates:
+                finish_reason = getattr(response, 'prompt_feedback', 'No prompt_feedback attribute')
+                if hasattr(finish_reason, 'block_reason'):
+                    finish_reason = f"Blocked due to: {finish_reason.block_reason}"
+                print(f"Error: Gemini response is empty or blocked. Finish reason: {finish_reason}")
+                return jsonify({"error": "AI model did not return a valid response (it might have been blocked).", "details_for_log": str(finish_reason)}), 500
+
+            # 步驟 2: 手動拼接所有 text parts
+            # 這是解決 "Multiple content parts are not supported" 的關鍵
+            full_response_text = "".join(part.text for part in response.candidates[0].content.parts if hasattr(part, 'text'))
+            
+            print(f"Combined raw AI response text (first 300 chars): {full_response_text[:300]}...")
+
+            # 步驟 3: 從拼接後的完整字串中提取 JSON 區塊
+            # 這個邏輯可以處理 JSON 前後有其他文字的情況
+            json_block_match = re.search(r"```json\s*(\{.*?\})\s*```", full_response_text, re.DOTALL)
+            
+            if json_block_match:
+                ai_response_text = json_block_match.group(1)
+                print("Successfully extracted JSON block using regex.")
+            else:
+                # 如果正則表達式找不到，作為備用方案，我們假設整個文本就是 JSON
+                # 這可以處理模型直接返回純 JSON 的情況
+                print("Warning: Could not find ```json``` block. Attempting to parse the whole text.")
+                ai_response_text = full_response_text
+
+            # 步驟 4: 解析提取出的 JSON 字串
             ai_result = json.loads(ai_response_text)
+
+            # 可選的健全性檢查
             if 'submissionType' not in ai_result or ai_result.get('submissionType') != submission_type:
                 print(f"Warning: AI returned submissionType ('{ai_result.get('submissionType')}') differs from request ('{submission_type}'). Correcting.")
                 ai_result['submissionType'] = submission_type
+            
             print("Successfully parsed AI JSON response.")
             return jsonify(ai_result)
+
         except json.JSONDecodeError as je:
             print(f"AI response JSON decode error: {je}")
-            print(f"Problematic AI response text: {ai_response_text}")
-            return jsonify({"error": "AI response format error (cannot parse JSON).", "details_for_log": ai_response_text[:500]}), 500
+            # 當解析失敗時，打印拼接後的完整文本，而不是可能不完整的 ai_response_text
+            print(f"Problematic AI response text: {full_response_text}")
+            return jsonify({"error": "AI response format error (cannot parse JSON).", "details_for_log": full_response_text[:500]}), 500
+        
+        except Exception as e:
+            print(f"Error processing Gemini response: {e}")
+            traceback.print_exc()
+            error_detail = str(response) if len(str(response)) < 500 else str(response)[:500] + "..."
+            return jsonify({"error": "Failed to process AI response.", "details_for_log": error_detail}), 500
 
     except Exception as e:
         print(f"Overall error in /api/grade: {e}")
         traceback.print_exc()
         return jsonify({"error": "Internal server error during grading.", "details": str(e)}), 500
-
 # --- 應用程式啟動 ---
 if __name__ == '__main__':
     # 從環境變數獲取 PORT，允許 Cloud Run 等平台設置
