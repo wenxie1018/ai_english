@@ -3,7 +3,6 @@ import json
 import os
 import re
 import traceback 
-import sys
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS # type: ignore
@@ -16,7 +15,7 @@ from vertexai.generative_models import GenerativeModel, Part, Tool, grounding, H
 
 # --- 初始化 Flask 應用 ---
 app = Flask(__name__)
-CORS(app) # 開發階段允許所有來源，生產環境應配置具體來源
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 
 # 加載環境變數
 load_dotenv() 
@@ -51,57 +50,6 @@ except Exception as e:
     traceback.print_exc()
 
 # --- 輔助函數 ---
-def get_size(obj):
-    """遞歸計算物件在記憶體中的大小（以MB為單位）。"""
-    seen_ids = set()
-    
-    def sizeof_detail(o):
-        if id(o) in seen_ids:
-            return 0
-        seen_ids.add(id(o))
-        size = sys.getsizeof(o)
-        if isinstance(o, dict):
-            size += sum(sizeof_detail(v) for v in o.values())
-            size += sum(sizeof_detail(k) for k in o.keys())
-        elif hasattr(o, '__dict__'):
-            size += sizeof_detail(o.__dict__)
-        elif hasattr(o, '__iter__') and not isinstance(o, (str, bytes, bytearray)):
-            size += sum(sizeof_detail(i) for i in o)
-        return size
-
-    return sizeof_detail(obj) / (1024 * 1024)
-
-def process_and_compress_image(file_bytes, max_size_mb=20, max_dimension=1200, quality=85):
-    """
-    檢查、壓縮並調整圖片大小。
-    返回壓縮後的圖片二進制數據，如果檔案過大或非圖片則返回 None。
-    """
-    file_size_mb = len(file_bytes) / (1024 * 1024)
-    if file_size_mb > max_size_mb:
-        print(f"ERROR: File is too large ({file_size_mb:.2f}MB), limit is {max_size_mb}MB.")
-        return None
-        
-    try:
-        img = Image.open(io.BytesIO(file_bytes))
-        
-        # 轉換為 RGB 以避免處理 RGBA 或 P 模式時的儲存問題
-        if img.mode not in ('RGB', 'L'): # L for grayscale
-            img = img.convert('RGB')
-            
-        img.thumbnail((max_dimension, max_dimension))
-        
-        output_buffer = io.BytesIO()
-        img.format = 'JPEG' # 強制存為 JPEG 以確保壓縮
-        img.save(output_buffer, format='JPEG', quality=quality)
-        compressed_bytes = output_buffer.getvalue()
-        
-        compressed_size_mb = len(compressed_bytes) / (1024 * 1024)
-        print(f"Image compressed from {file_size_mb:.2f}MB to {compressed_size_mb:.2f}MB.")
-        return compressed_bytes
-    except Exception as e:
-        print(f"ERROR: Could not process or compress image. It might not be a valid image file. Error: {e}")
-        return None
-    
 def perform_ocr(image_file_storage): # <--- 恢復 perform_ocr 函數
     """使用 Google Cloud Vision API 對圖片文件執行 OCR。"""
     if not image_file_storage:
@@ -921,10 +869,6 @@ def grade_writing():
             HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
             HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
         }
-
-        # 在呼叫 gemini_model.generate_content(...) 之前
-        print(f"DEBUG: Size of final_prompt in memory: {get_size(final_prompt):.2f} MB")
-        print(f"DEBUG: Size of contents_for_gemini list in memory: {get_size(contents_for_gemini):.2f} MB")
 
         print("Calling Gemini model with non-streaming mode...")
         
