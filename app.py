@@ -909,8 +909,8 @@ def grade_writing():
         # --- 5. 調用 Gemini 模型 ---
         generation_config = {
             "temperature": 0.1,
-            "top_p": 0.2,
-            "max_output_tokens": 16384,
+            "top_p": 0.5,
+            "max_output_tokens": 8192,
             "response_mime_type": "application/json",
         }
 
