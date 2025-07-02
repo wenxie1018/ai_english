@@ -866,7 +866,6 @@ def grade_writing():
             contents_for_gemini,
             generation_config=generation_config,
             tools=tools_list
-            request_options={"timeout": 600}
         )
         print("Gemini model responded.")
 
