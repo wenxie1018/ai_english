@@ -1,8 +1,14 @@
-flask
-flask-cors
+# FastAPI and Server
+fastapi
+uvicorn[standard]
+gunicorn
+python-multipart
+
+# Google Cloud Libraries
+google-cloud-aiplatform
 google-cloud-vision
 google-cloud-storage
-google-cloud-aiplatform
-gunicorn
+
+# Utilities
 python-dotenv
-Pillow
+pydantic
