@@ -19,7 +19,7 @@ from vertexai.generative_models import GenerativeModel, Part, Tool, grounding, H
 # --- 環境變數加載 ---
 from dotenv import load_dotenv
 load_dotenv()
-
+app = FastAPI()
 # ==============================================================================
 # 2. PYDANTIC 模型 (保持不變)
 # ==============================================================================
