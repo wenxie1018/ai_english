@@ -1,14 +1,9 @@
-# FastAPI and Server
 fastapi
-uvicorn[standard]
 gunicorn
+uvicorn[standard]
 python-multipart
-
-# Google Cloud Libraries
 google-cloud-aiplatform
 google-cloud-vision
 google-cloud-storage
-
-# Utilities
 python-dotenv
 pydantic
