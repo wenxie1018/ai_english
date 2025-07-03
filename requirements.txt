@@ -1,9 +1,16 @@
+# requirements.txt
+# 這是運行 FastAPI 應用的核心依賴
 fastapi
-gunicorn
 uvicorn[standard]
-python-multipart
-google-cloud-aiplatform
+gunicorn
+
+# 這是加載 .env 檔案的依賴 (雖然在雲端用不到，但為了本地開發一致性保留)
+python-dotenv
+
+# 這是 Google Cloud 和 Vertex AI 的核心依賴
 google-cloud-vision
 google-cloud-storage
-python-dotenv
-pydantic
+google-cloud-aiplatform
+
+# 處理 multipart/form-data (例如檔案上傳)
+python-multipart
